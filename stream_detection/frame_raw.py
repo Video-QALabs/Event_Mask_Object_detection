@@ -8,8 +8,12 @@ os.environ["HDF5_PLUGIN_PATH"] = hdf5plugin.PLUGIN_PATH
 
 from metavision_core.event_io import RawReader
 
+from dbscan import run_dbscan_on_image, overlay_clusters
+import cv2
+import argparse
+
 os.environ["MV_HAL_PLUGIN_PATH"] = "/lib/metavision/hal/plugins"
-raw_filepath= "/mnt/SSD_1TB/EventBoard/REC3/cam2/rec.raw"
+# raw_filepath= "/mnt/SSD_1TB/EventBoard/REC3/cam2/rec.raw"
 DELTA_T = 100000  # in microseconds
 
 STREAM_H, STREAM_W = 720, 1280
@@ -74,7 +78,7 @@ def visualize_batches_3D(events):
             break
         plt.pause(0.05)
 
-def visualize_batches_frame(events):
+def visualize_batches_frame(events, to_plot=False):
     state = globals().setdefault("_ev2d_state", {})
 
     def _on_key(ev):
@@ -91,33 +95,85 @@ def visualize_batches_frame(events):
     frame[y[p], x[p]] = (255, 0, 0)
     frame[y[~p], x[~p]] = (0, 0, 255)
 
-    if "fig" not in state or not plt.fignum_exists(state["fig"].number):
+    if to_plot and ("fig" not in state or not plt.fignum_exists(state["fig"].number)):
         state["fig"] = plt.figure(figsize=(16, 9), dpi=120)
         state["fig"].canvas.mpl_connect("key_press_event", _on_key)
         state["ax"] = state["fig"].add_axes([0.02, 0.04, 0.96, 0.94])
         state["im"] = state["ax"].imshow(frame)
-    else:
+    elif to_plot:
         state["im"].set_data(frame)
+    
+    if to_plot:
+        state["ax"].set_title(f"Batch of {int(events.size)} events - press 'n' for next, 'q' to quit")
+        plt.draw()    
+        while True:
+            if not plt.fignum_exists(state["fig"].number):
+                sys.exit(0)
+            if state.get("proceed"):
+                break
+            plt.pause(0.05)
+    else:
+        state["proceed"] = True
+        return frame
 
-    state["ax"].set_title(f"Batch of {int(events.size)} events - press 'n' for next, 'q' to quit")
-
-    plt.draw()
-    state["proceed"] = False
-    while True:
-        if not plt.fignum_exists(state["fig"].number):
-            sys.exit(0)
-        if state.get("proceed"):
-            break
-        plt.pause(0.05)
-
+PLOT_CLUSTERS = False
 
 if __name__ == "__main__":
-    reader = RawReader(raw_filepath)
-    for events in event_batch_generator(reader):
+    parser = argparse.ArgumentParser(description="Process an event RAW file and write output frames.")
+    parser.add_argument("rawfile", help="Path to the input .raw file")
+    parser.add_argument("outdir", help="Directory to save output frames")
+    args = parser.parse_args()
+
+    raw_filepath = args.rawfile
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    reader = RawReader(raw_filepath)    
+    for fidx, events in enumerate(event_batch_generator(reader)):
+        # print(f"Processing frame {fidx}")
         # visualize_batches_3D(events)
+        frame= visualize_batches_frame(events)        
 
-        visualize_batches_frame(events)
+        # Run DBSCAN on the frame
+        _, clustered_img, cluster_stats = run_dbscan_on_image(frame, eps=10.0, min_samples=30, th=32, morph_open=0)
+        # print(f"Detected {len(cluster_stats)} clusters in the frame")
 
+        vis, stats= overlay_clusters(frame, clustered_img, cluster_stats, draw_boxes=True)
+        
+        if not PLOT_CLUSTERS:
+            cv2.imwrite(f"{args.outdir}/frame_{fidx:05d}.png", vis)
+            # print(f"Saved frame_{fidx:05d}.png with {len(cluster_stats)} clusters")
+            if fidx and fidx % 100 == 0:
+                print(f"Processed {fidx} frames, last had {len(cluster_stats)} clusters")
+            continue
+        
+        plt.figure(figsize=(16, 9), dpi=120)
+        plt.imshow(vis)
+        plt.title(f"DBSCAN Clusters - {len(cluster_stats)} clusters detected - press 'n' for next, 'q' to quit")
+
+        fig = plt.gcf()
+        _wait_state = {"go": False}
+        _wait_state["quit"] = False
+
+        def _on_space(ev):
+            if ev.key in (" ", "space"):
+                _wait_state["go"] = True
+            if ev.key == "q":
+                plt.close(fig)
+                _wait_state["quit"] = True
+
+        fig.canvas.mpl_connect("key_press_event", _on_space)
+
+        while True:
+            if not plt.fignum_exists(fig.number):
+                break
+            if _wait_state["go"]:
+                plt.close(fig)
+                break
+            if _wait_state.get("quit"):
+                sys.exit(0)
+            plt.pause(0.05)
+                
         # print(type(events), events.size)
         # print(np.asarray(events).shape)
         # break
