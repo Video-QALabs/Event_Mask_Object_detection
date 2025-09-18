@@ -14,7 +14,7 @@ import argparse
 
 os.environ["MV_HAL_PLUGIN_PATH"] = "/lib/metavision/hal/plugins"
 # raw_filepath= "/mnt/SSD_1TB/EventBoard/REC3/cam2/rec.raw"
-DELTA_T = 100000  # in microseconds
+DELTA_T = 100000    # in microseconds
 
 STREAM_H, STREAM_W = 720, 1280
 
@@ -225,6 +225,82 @@ def draw_labeled_boxes(img, labeled_stats):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, lineType=cv2.LINE_AA)
     return vis
 
+def merge_overlapping_clusters(stats):
+    """Merge clusters whose bounding boxes overlap into combined clusters.
+
+    Returns a new list of ClusterStat with merged bbox, weighted centroid, and summed size.
+    """
+    def _bbox_xyxy(b):
+        x, y, w, h = b
+        return x, y, x + w - 1, y + h - 1
+
+
+    def _boxes_overlap(b1, b2):
+        x1, y1, x2, y2 = _bbox_xyxy(b1)
+        X1, Y1, X2, Y2 = _bbox_xyxy(b2)
+        return not (x2 < X1 or X2 < x1 or y2 < Y1 or Y2 < y1)
+
+    if not stats:
+        return stats
+
+    try:
+        from dbscan import ClusterStat
+    except Exception:
+        ClusterStat = None  # type: ignore
+
+    n = len(stats)
+    adj = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _boxes_overlap(stats[i].bbox, stats[j].bbox):
+                adj[i].append(j)
+                adj[j].append(i)
+
+    visited = [False] * n
+    groups = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        stack = [i]
+        visited[i] = True
+        comp = []
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    stack.append(v)
+        groups.append(comp)
+
+    merged = []
+    for comp in groups:
+        if len(comp) == 1:
+            merged.append(stats[comp[0]])
+            continue
+        # Merge component
+        total_size = sum(stats[k].size for k in comp)
+        if total_size == 0:
+            total_size = 1
+        cx = sum(stats[k].centroid[0] * stats[k].size for k in comp) / total_size
+        cy = sum(stats[k].centroid[1] * stats[k].size for k in comp) / total_size
+        # Union bbox
+        xs1, ys1, xs2, ys2 = [], [], [], []
+        for k in comp:
+            x1, y1, x2, y2 = _bbox_xyxy(stats[k].bbox)
+            xs1.append(x1); ys1.append(y1); xs2.append(x2); ys2.append(y2)
+        ux1, uy1, ux2, uy2 = min(xs1), min(ys1), max(xs2), max(ys2)
+        ubbox = (int(ux1), int(uy1), int(ux2 - ux1 + 1), int(uy2 - uy1 + 1))
+        # Choose a representative label (min of group) if dataclass is available
+        rep_label = min(stats[k].label for k in comp)
+        if ClusterStat is not None:
+            merged.append(ClusterStat(label=int(rep_label), size=int(total_size), centroid=(float(cx), float(cy)), bbox=ubbox))
+        else:
+            # Fallback to a dict-like object if dataclass is not importable
+            merged.append(type("_Cluster", (), {"label": int(rep_label), "size": int(total_size), "centroid": (float(cx), float(cy)), "bbox": ubbox})())
+
+    return merged
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process an event RAW file and write output frames.")
@@ -236,17 +312,20 @@ if __name__ == "__main__":
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    reader = RawReader(raw_filepath)    
+    reader = RawReader(raw_filepath)
     for fidx, events in enumerate(event_batch_generator(reader)):
         # print(f"Processing frame {fidx}")
         # visualize_batches_3D(events)
-        frame= visualize_batches_frame(events)        
+        frame = visualize_batches_frame(events)
 
         # Run DBSCAN on the frame
-        mask, pts, labels = run_dbscan_on_image(frame, eps=5.0, min_samples=30, th=32, morph_open=0)
+        frame_blur = cv2.GaussianBlur(frame.copy(), (5, 5), sigmaX=0, sigmaY=0)
+        mask, pts, labels = run_dbscan_on_image(frame_blur, eps=10.0, min_samples=30, th=32, morph_open=0)
         # Compute stats from points/labels
         from dbscan import compute_cluster_stats  # local import from same folder
         stats = compute_cluster_stats(labels, pts)
+        # Merge overlapping clusters
+        stats = merge_overlapping_clusters(stats)
         # Reassign stable IDs
         labeled_stats = reassign_labels_by_centroid(stats, fidx, max_centroid_dist=20.0)
         print(f"Detected {len(labeled_stats)} clusters in the frame")
