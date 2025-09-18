@@ -17,6 +17,7 @@ os.environ["MV_HAL_PLUGIN_PATH"] = "/lib/metavision/hal/plugins"
 DELTA_T = 100000    # in microseconds
 
 STREAM_H, STREAM_W = 720, 1280
+PLOT_CLUSTERS = False
 
 def event_batch_generator(reader, delta_t=DELTA_T, max_batches=None):
     yielded = 0
@@ -116,7 +117,6 @@ def visualize_batches_frame(events, to_plot=False):
         state["proceed"] = True
         return frame
 
-PLOT_CLUSTERS = True
 
 def show_clusters_interactive(vis_img, num_clusters):
     """Show or update a persistent window for cluster visualization.
@@ -159,20 +159,31 @@ def show_clusters_interactive(vis_img, num_clusters):
 _tracker_state = {
     "tracks": {},   # id -> {centroid: (x,y), bbox: (x,y,w,h), last_seen: frame_idx}
     "next_id": 0,
+    "max_history": 64,
 }
-
-
-def _euclid2(a, b):
-    dx = a[0] - b[0]
-    dy = a[1] - b[1]
-    return dx * dx + dy * dy
-
 
 def reassign_labels_by_centroid(stats, frame_idx, max_centroid_dist=50.0):
     """Assign stable IDs to current clusters by nearest previous centroid.
 
     Returns list of tuples (track_id, stat) and updates global _tracker_state.
     """
+
+    def _euclid2(a, b):
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        return dx * dx + dy * dy
+
+
+    def _color_from_id(tid: int):
+        """Deterministic bright BGR color from integer id."""
+        # Use a simple hash-based color; ensure it's vivid.
+        r = (37 * tid + 17) % 255
+        g = (91 * tid + 53) % 255
+        b = (17 * tid + 199) % 255
+        # Avoid too dark colors
+        r = max(r, 64); g = max(g, 64); b = max(b, 64)
+        return int(b), int(g), int(r)
+
     global _tracker_state
     tracks = _tracker_state["tracks"]
     used_prev = set()
@@ -197,12 +208,33 @@ def reassign_labels_by_centroid(stats, frame_idx, max_centroid_dist=50.0):
             # Create new track
             tid = _tracker_state["next_id"]
             _tracker_state["next_id"] += 1
+            tracks[tid] = {
+                "centroid": c,
+                "bbox": st.bbox,
+                "last_seen": frame_idx,
+                "size": st.size,
+                "history": [c],
+                "color": _color_from_id(tid),
+            }
         else:
             tid = best_id
             used_prev.add(tid)
-
-        # Update track info
-        tracks[tid] = {"centroid": c, "bbox": st.bbox, "last_seen": frame_idx, "size": st.size}
+            # Update track info and append history
+            tinfo = tracks.get(tid, {})
+            hist = tinfo.get("history", [])
+            hist.append(c)
+            # Trim history
+            max_hist = _tracker_state.get("max_history", 64)
+            if len(hist) > max_hist:
+                hist = hist[-max_hist:]
+            tracks[tid] = {
+                "centroid": c,
+                "bbox": st.bbox,
+                "last_seen": frame_idx,
+                "size": st.size,
+                "history": hist,
+                "color": tinfo.get("color", _color_from_id(tid)),
+            }
         labeled.append((tid, st))
 
     # Optionally prune stale tracks (not seen for N frames)
@@ -216,13 +248,24 @@ def reassign_labels_by_centroid(stats, frame_idx, max_centroid_dist=50.0):
 
 def draw_labeled_boxes(img, labeled_stats):
     vis = img.copy()
+    # Draw boxes and current centroids
     for tid, st in labeled_stats:
         x, y, w_box, h_box = st.bbox
-        cv2.rectangle(vis, (x, y), (x + w_box, y + h_box), (0, 255, 0), 1)
+        color = _tracker_state["tracks"].get(tid, {}).get("color", (0, 255, 0))
+        cv2.rectangle(vis, (x, y), (x + w_box, y + h_box), color, 1)
         cx, cy = int(st.centroid[0]), int(st.centroid[1])
         cv2.circle(vis, (cx, cy), 2, (0, 255, 255), -1)
         cv2.putText(vis, f"id={tid} n={st.size}", (x, max(0, y - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, lineType=cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, lineType=cv2.LINE_AA)
+
+    # Draw centroid paths for all tracks
+    for tid, tinfo in _tracker_state["tracks"].items():
+        hist = tinfo.get("history", [])
+        if len(hist) < 2:
+            continue
+        pts = np.array([[int(p[0]), int(p[1])] for p in hist], dtype=np.int32).reshape(-1, 1, 2)
+        color = tinfo.get("color", (0, 255, 0))
+        cv2.polylines(vis, [pts], isClosed=False, color=color, thickness=1, lineType=cv2.LINE_AA)
     return vis
 
 def merge_overlapping_clusters(stats):
@@ -321,14 +364,18 @@ if __name__ == "__main__":
         # Run DBSCAN on the frame
         frame_blur = cv2.GaussianBlur(frame.copy(), (5, 5), sigmaX=0, sigmaY=0)
         mask, pts, labels = run_dbscan_on_image(frame_blur, eps=10.0, min_samples=30, th=32, morph_open=0)
-        # Compute stats from points/labels
+        
+        # Compute stats from points/labels        
         from dbscan import compute_cluster_stats  # local import from same folder
         stats = compute_cluster_stats(labels, pts)
+                
         # Merge overlapping clusters
         stats = merge_overlapping_clusters(stats)
+        
         # Reassign stable IDs
         labeled_stats = reassign_labels_by_centroid(stats, fidx, max_centroid_dist=20.0)
-        print(f"Detected {len(labeled_stats)} clusters in the frame")
+        
+        # print(f"Detected {len(labeled_stats)} clusters in the frame")
         # Draw with stable IDs
         vis = draw_labeled_boxes(frame, labeled_stats)
 
@@ -340,10 +387,5 @@ if __name__ == "__main__":
 
         # Show/update a persistent window instead of creating a new one
         show_clusters_interactive(vis, len(labeled_stats))
-
-        # print(type(events), events.size)
-        # print(np.asarray(events).shape)
-        # break
-
 
 

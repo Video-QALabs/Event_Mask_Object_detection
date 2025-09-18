@@ -55,7 +55,7 @@ def compute_cluster_stats(labels: np.ndarray, pts: np.ndarray) -> List[ClusterSt
     stats: List[ClusterStat] = []
     unique_labels = [l for l in np.unique(labels) if l != -1]
 
-    print(f"{len(unique_labels)} unique clusters out of {labels.size}")
+    # print(f"{len(unique_labels)} unique clusters out of {labels.size}")
     for lab in unique_labels:
         idx = labels == lab
         if not np.any(idx):
