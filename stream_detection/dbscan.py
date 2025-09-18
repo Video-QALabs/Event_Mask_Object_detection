@@ -54,6 +54,8 @@ def extract_points(mask: np.ndarray) -> np.ndarray:
 def compute_cluster_stats(labels: np.ndarray, pts: np.ndarray) -> List[ClusterStat]:
     stats: List[ClusterStat] = []
     unique_labels = [l for l in np.unique(labels) if l != -1]
+
+    print(f"{len(unique_labels)} unique clusters out of {labels.size}")
     for lab in unique_labels:
         idx = labels == lab
         if not np.any(idx):
@@ -92,20 +94,22 @@ def overlay_clusters(img: np.ndarray, pts: np.ndarray, labels: np.ndarray,
         base = img.copy()
 
     overlay = base.copy()
-    palette = colorize_labels(labels)
+    # palette = colorize_labels(labels)
 
     # Draw points
-    for (x, y), lab in zip(pts.astype(int), labels):
-        if lab == -1:
-            color = (128, 128, 128)
-        else:
-            color = tuple(int(c) for c in palette[lab].tolist())
-        cv2.circle(overlay, (int(x), int(y)), point_size, color, -1, lineType=cv2.LINE_AA)
+    # for (x, y), lab in zip(pts.astype(int), labels):
+    #     if lab == -1:
+    #         color = (128, 128, 128)
+    #     else:
+    #         color = tuple(int(c) for c in palette[lab].tolist())
+    #     cv2.circle(overlay, (int(x), int(y)), point_size, color, -1, lineType=cv2.LINE_AA)
 
     out = cv2.addWeighted(overlay, alpha, base, 1 - alpha, 0)
 
     # Stats and optional boxes
     stats = compute_cluster_stats(labels, pts)
+    print(f"Found {len(stats)} clusters (excluding noise)")
+
     if draw_boxes:
         for st in stats:
             x, y, w_box, h_box = st.bbox
@@ -137,45 +141,3 @@ def run_dbscan_on_image(img: np.ndarray, eps: float, min_samples: int, th: int,
     return mask, pts, labels
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="DBSCAN clustering on an image frame and visualization.")
-    p.add_argument("--image", required=True, help="Path to input image (png/jpg)")
-    p.add_argument("--eps", type=float, default=3.0, help="Neighborhood radius in pixels")
-    p.add_argument("--min-samples", type=int, default=10, help="Minimum points to form a cluster")
-    p.add_argument("--th", type=int, default=32, help="Threshold for foreground (0-255)")
-    p.add_argument("--open", type=int, default=0, help="Morphological open kernel size (0 to disable)")
-    p.add_argument("--save", default=None, help="Optional output path to save visualization")
-    p.add_argument("--show", action="store_true", help="Show the result in a window")
-    return p.parse_args()
-
-
-def main() -> None:
-    
-    args = parse_args()
-    if not os.path.isfile(args.image):
-        raise SystemExit(f"Image not found: {args.image}")
-
-    img = cv2.imread(args.image, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise SystemExit(f"Failed to read image: {args.image}")
-
-    mask, pts, labels = run_dbscan_on_image(img, args.eps, args.min_samples, args.th, args.open)
-    vis, stats = overlay_clusters(img, pts, labels)
-
-    if args.save:
-        out_path = args.save
-        ok = cv2.imwrite(out_path, vis)
-        if not ok:
-            raise SystemExit(f"Failed to save: {out_path}")
-        print(f"Saved: {out_path} | clusters: {len(stats)} | points: {pts.shape[0]}")
-
-    if args.show or not args.save:
-        win = "DBSCAN Clusters"
-        cv2.imshow(win, vis)
-        print(f"clusters: {len(stats)} | points: {pts.shape[0]}")
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
-
-
-# if __name__ == "__main__":
-#     main()

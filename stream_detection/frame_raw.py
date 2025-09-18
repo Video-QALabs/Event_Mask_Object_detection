@@ -116,7 +116,115 @@ def visualize_batches_frame(events, to_plot=False):
         state["proceed"] = True
         return frame
 
-PLOT_CLUSTERS = False
+PLOT_CLUSTERS = True
+
+def show_clusters_interactive(vis_img, num_clusters):
+    """Show or update a persistent window for cluster visualization.
+    Press space to advance (update image in same window). Press 'q' to quit.
+    """
+    state = globals().setdefault("_clusters_state", {})
+
+    def _on_key(ev):
+        if ev.key in (" ", "space"):
+            state["proceed"] = True
+        elif ev.key == "q":
+            # Close window and exit entirely
+            if "fig" in state and plt.fignum_exists(state["fig"].number):
+                plt.close(state["fig"])
+            sys.exit(0)
+
+    # Create persistent figure on first call, otherwise update image data
+    if "fig" not in state or not plt.fignum_exists(state["fig"].number):
+        state["fig"] = plt.figure(figsize=(16, 9), dpi=120)
+        state["fig"].canvas.mpl_connect("key_press_event", _on_key)
+        state["ax"] = state["fig"].add_axes([0.02, 0.04, 0.96, 0.94])
+        state["im"] = state["ax"].imshow(vis_img)
+    else:
+        state["im"].set_data(vis_img)
+
+    state["ax"].set_title(f"DBSCAN Clusters - {int(num_clusters)} clusters detected - press 'space' for next, 'q' to quit")
+    plt.draw()
+
+    state["proceed"] = False
+    while True:
+        if not plt.fignum_exists(state["fig"].number):
+            # Window closed by user; exit to stop the loop
+            sys.exit(0)
+        if state.get("proceed"):
+            break
+        plt.pause(0.05)
+
+
+# --- Simple centroid-based tracker to persist cluster IDs across batches ---
+_tracker_state = {
+    "tracks": {},   # id -> {centroid: (x,y), bbox: (x,y,w,h), last_seen: frame_idx}
+    "next_id": 0,
+}
+
+
+def _euclid2(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return dx * dx + dy * dy
+
+
+def reassign_labels_by_centroid(stats, frame_idx, max_centroid_dist=50.0):
+    """Assign stable IDs to current clusters by nearest previous centroid.
+
+    Returns list of tuples (track_id, stat) and updates global _tracker_state.
+    """
+    global _tracker_state
+    tracks = _tracker_state["tracks"]
+    used_prev = set()
+    labeled = []
+
+    max_d2 = max_centroid_dist * max_centroid_dist
+
+    # Greedy nearest matching to previous tracks
+    for st in stats:
+        c = st.centroid  # (cx, cy)
+        best_id = None
+        best_d2 = None
+        for tid, tinfo in tracks.items():
+            if tid in used_prev:
+                continue
+            d2 = _euclid2(c, tinfo["centroid"])
+            if d2 <= max_d2 and (best_d2 is None or d2 < best_d2):
+                best_d2 = d2
+                best_id = tid
+
+        if best_id is None:
+            # Create new track
+            tid = _tracker_state["next_id"]
+            _tracker_state["next_id"] += 1
+        else:
+            tid = best_id
+            used_prev.add(tid)
+
+        # Update track info
+        tracks[tid] = {"centroid": c, "bbox": st.bbox, "last_seen": frame_idx, "size": st.size}
+        labeled.append((tid, st))
+
+    # Optionally prune stale tracks (not seen for N frames)
+    stale_horizon = 30
+    to_del = [tid for tid, tinfo in tracks.items() if frame_idx - tinfo.get("last_seen", frame_idx) > stale_horizon]
+    for tid in to_del:
+        tracks.pop(tid, None)
+
+    return labeled
+
+
+def draw_labeled_boxes(img, labeled_stats):
+    vis = img.copy()
+    for tid, st in labeled_stats:
+        x, y, w_box, h_box = st.bbox
+        cv2.rectangle(vis, (x, y), (x + w_box, y + h_box), (0, 255, 0), 1)
+        cx, cy = int(st.centroid[0]), int(st.centroid[1])
+        cv2.circle(vis, (cx, cy), 2, (0, 255, 255), -1)
+        cv2.putText(vis, f"id={tid} n={st.size}", (x, max(0, y - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1, lineType=cv2.LINE_AA)
+    return vis
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process an event RAW file and write output frames.")
@@ -135,45 +243,25 @@ if __name__ == "__main__":
         frame= visualize_batches_frame(events)        
 
         # Run DBSCAN on the frame
-        _, clustered_img, cluster_stats = run_dbscan_on_image(frame, eps=10.0, min_samples=30, th=32, morph_open=0)
-        # print(f"Detected {len(cluster_stats)} clusters in the frame")
+        mask, pts, labels = run_dbscan_on_image(frame, eps=5.0, min_samples=30, th=32, morph_open=0)
+        # Compute stats from points/labels
+        from dbscan import compute_cluster_stats  # local import from same folder
+        stats = compute_cluster_stats(labels, pts)
+        # Reassign stable IDs
+        labeled_stats = reassign_labels_by_centroid(stats, fidx, max_centroid_dist=20.0)
+        print(f"Detected {len(labeled_stats)} clusters in the frame")
+        # Draw with stable IDs
+        vis = draw_labeled_boxes(frame, labeled_stats)
 
-        vis, stats= overlay_clusters(frame, clustered_img, cluster_stats, draw_boxes=True)
-        
         if not PLOT_CLUSTERS:
             cv2.imwrite(f"{args.outdir}/frame_{fidx:05d}.png", vis)
-            # print(f"Saved frame_{fidx:05d}.png with {len(cluster_stats)} clusters")
             if fidx and fidx % 100 == 0:
-                print(f"Processed {fidx} frames, last had {len(cluster_stats)} clusters")
+                print(f"Processed {fidx} frames, last had {len(labeled_stats)} clusters")
             continue
-        
-        plt.figure(figsize=(16, 9), dpi=120)
-        plt.imshow(vis)
-        plt.title(f"DBSCAN Clusters - {len(cluster_stats)} clusters detected - press 'n' for next, 'q' to quit")
 
-        fig = plt.gcf()
-        _wait_state = {"go": False}
-        _wait_state["quit"] = False
+        # Show/update a persistent window instead of creating a new one
+        show_clusters_interactive(vis, len(labeled_stats))
 
-        def _on_space(ev):
-            if ev.key in (" ", "space"):
-                _wait_state["go"] = True
-            if ev.key == "q":
-                plt.close(fig)
-                _wait_state["quit"] = True
-
-        fig.canvas.mpl_connect("key_press_event", _on_space)
-
-        while True:
-            if not plt.fignum_exists(fig.number):
-                break
-            if _wait_state["go"]:
-                plt.close(fig)
-                break
-            if _wait_state.get("quit"):
-                sys.exit(0)
-            plt.pause(0.05)
-                
         # print(type(events), events.size)
         # print(np.asarray(events).shape)
         # break
