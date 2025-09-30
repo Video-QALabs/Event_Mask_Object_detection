@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
 """
 DBSCAN clustering on an image frame and visualization.
-
-- Converts input image to grayscale and thresholds to select foreground points
-- Runs sklearn.cluster.DBSCAN in pixel space (x,y)
-- Colors each cluster and overlays on original image
-- Optionally draws cluster bounding boxes and centroids
-
-Usage (from repo root):
-  python scripts/dbscan.py --image path/to/frame.png --eps 3.0 --min-samples 10 --th 32 --save out.png
-
-Notes:
-- eps is in pixels; scale according to object size
-- For dense blobs, connected components may be faster than DBSCAN
 """
+
 from __future__ import annotations
 import argparse
 from dataclasses import dataclass
@@ -93,16 +82,7 @@ def overlay_clusters(img: np.ndarray, pts: np.ndarray, labels: np.ndarray,
     else:
         base = img.copy()
 
-    overlay = base.copy()
-    # palette = colorize_labels(labels)
-
-    # Draw points
-    # for (x, y), lab in zip(pts.astype(int), labels):
-    #     if lab == -1:
-    #         color = (128, 128, 128)
-    #     else:
-    #         color = tuple(int(c) for c in palette[lab].tolist())
-    #     cv2.circle(overlay, (int(x), int(y)), point_size, color, -1, lineType=cv2.LINE_AA)
+    overlay = base.copy()    
 
     out = cv2.addWeighted(overlay, alpha, base, 1 - alpha, 0)
 
